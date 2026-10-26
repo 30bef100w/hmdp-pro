@@ -18,6 +18,8 @@ public class RedisConstants {
     public static final Long LOCK_SHOP_TTL = 10L;
 
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
+    /** 已执行的关单 Redis 库存回补标记，Lua 使用订单 ID 保证只加一次 */
+    public static final String SECKILL_STOCK_RESTORED_KEY = "seckill:stock:restored:";
     /** 秒杀成功 claim 用户集合（Lua 脚本 SADD 写入，一人一单与补单差集依据） */
     public static final String SECKILL_ORDER_KEY = "seckill:order:";
     /** RocketMQ 事务消息本地标记（与 Lua 扣库存同脚本写入，回查用） */

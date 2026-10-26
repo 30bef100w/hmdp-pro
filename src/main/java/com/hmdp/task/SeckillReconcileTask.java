@@ -66,6 +66,7 @@ public class SeckillReconcileTask {
         }
         try {
             closeTimeoutOrders();
+            restoreCancelledOrderRedisStocks();
             supplementMissingOrders();
             reconcileFinishedStocks();
         } catch (Exception e) {
@@ -90,6 +91,22 @@ public class SeckillReconcileTask {
         if (!expired.isEmpty()) {
             // expired.size() 是扫描数，CAS 会跳过已支付/已取消的，实际关闭数 ≤ 扫描数
             log.warn("对账关单兜底：扫描到 {} 笔超时未支付订单（CAS 幂等，已处理过的自动跳过）", expired.size());
+        }
+    }
+
+    /** 关单 DB 事务已提交但 Redis 回补失败时，按订单 ID 幂等重试。 */
+    private void restoreCancelledOrderRedisStocks() {
+        List<VoucherOrder> pending = voucherOrderService.lambdaQuery()
+                .eq(VoucherOrder::getStatus, RedisConstants.ORDER_STATUS_CANCELLED)
+                .eq(VoucherOrder::getRedisStockRestored, false)
+                .last("LIMIT 200")
+                .list();
+        for (VoucherOrder order : pending) {
+            try {
+                voucherOrderService.restoreCancelledOrderRedisStock(order.getId());
+            } catch (Exception e) {
+                log.error("订单 {} Redis 库存回补重试失败", order.getId(), e);
+            }
         }
     }
 

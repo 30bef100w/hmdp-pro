@@ -57,6 +57,7 @@
 ## 运行
 
 JDK 8 · MySQL · Redis · RocketMQ → 导入 `src/main/resources/db/hmdp.sql` → 填写 `application.yaml` 占位配置 → `seckill.mode=A`（默认）或 `B`（第二种写策略）。  
+已有数据库升级时，先执行 `src/main/resources/db/migrate-redis-stock-restored.sql`，再启动新版应用；全新导入 `hmdp.sql` 不需要执行迁移。
 网关示例配置：`src/main/resources/openresty/`。
 
 如果这个项目对你复习高并发或准备面试有帮助，欢迎点一颗 Star 支持一下。

@@ -53,6 +53,9 @@ public class VoucherOrder implements Serializable {
      */
     private Integer status;
 
+    /** 关单后 Redis 库存是否已回补；新订单默认已完成，关单事务中置为 false */
+    private Boolean redisStockRestored;
+
     /**
      * 下单时间
      */

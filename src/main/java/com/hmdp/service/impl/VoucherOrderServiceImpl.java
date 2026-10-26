@@ -22,9 +22,12 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronizationAdapter;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
@@ -58,6 +61,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private StringRedisTemplate stringRedisTemplate;
     @Resource
     private RocketMQProducer rocketMQProducer;
+    @Resource
+    private PlatformTransactionManager transactionManager;
 
     /** 秒杀方案：A=入口预扣+事务消息；B=限流入队+消费者校验 */
     @Value("${seckill.mode:A}")
@@ -68,6 +73,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private static final DefaultRedisScript<Long> SECKILL_STOCK_ONLY_SCRIPT;
     /** 方案 B 消费者：Redis claim 库存+一人一单 */
     private static final DefaultRedisScript<Long> SECKILL_CLAIM_SCRIPT;
+    /** 关单后按订单 ID 幂等回补 Redis 库存 */
+    private static final DefaultRedisScript<Long> RESTORE_CANCELLED_STOCK_SCRIPT;
 
     /** Redis 开关：seckill:test:protection = FULL|HEIMA|EARLY（默认 FULL） */
     public static final String ONE_ORDER_PROTECTION_KEY = "seckill:test:protection";
@@ -84,6 +91,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_CLAIM_SCRIPT = new DefaultRedisScript<>();
         SECKILL_CLAIM_SCRIPT.setLocation(new ClassPathResource("seckill-claim.lua"));
         SECKILL_CLAIM_SCRIPT.setResultType(Long.class);
+
+        RESTORE_CANCELLED_STOCK_SCRIPT = new DefaultRedisScript<>();
+        RESTORE_CANCELLED_STOCK_SCRIPT.setLocation(new ClassPathResource("restore-cancelled-stock.lua"));
+        RESTORE_CANCELLED_STOCK_SCRIPT.setResultType(Long.class);
     }
 
     private String oneOrderProtection() {
@@ -105,6 +116,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // 状态置为已取消
         boolean updated = update()
                 .set("status", ORDER_STATUS_CANCELLED)
+                .set("redis_stock_restored", false)
                 .eq("id", orderId)
                 .eq("status", ORDER_STATUS_UNPAID)
                 .update();
@@ -122,19 +134,48 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             throw new IllegalStateException("秒杀券不存在，无法回补库存: " + order.getVoucherId());
         }
 
-        // Redis 是派生库存，只在 DB 事务提交后更新。进程在提交后崩溃时由对账任务修复 Redis。
+        // 只在 DB 提交后补 Redis；进程中断或 Redis 故障时，由待补标记驱动定时重试。
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronizationAdapter() {
             @Override
             public void afterCommit() {
                 try {
-                    stringRedisTemplate.opsForValue().increment(SECKILL_STOCK_KEY + order.getVoucherId());
+                    restoreCancelledOrderRedisStock(orderId);
                 } catch (Exception e) {
-                    log.error("订单 {} 已取消，但 Redis 库存回补失败，等待对账修复，券 {}",
+                    log.error("订单 {} 已取消，但 Redis 库存回补失败，等待定时重试，券 {}",
                             orderId, order.getVoucherId(), e);
                 }
             }
         });
-        log.info("订单 {} 超时未支付，已取消并回补库存，券 {}", orderId, order.getVoucherId());
+        log.info("订单 {} 超时未支付，已取消并回补 DB 库存，券 {}", orderId, order.getVoucherId());
+    }
+
+    @Override
+    public void restoreCancelledOrderRedisStock(Long orderId) {
+        VoucherOrder order = getById(orderId);
+        if (order == null || order.getStatus() != ORDER_STATUS_CANCELLED
+                || !Boolean.FALSE.equals(order.getRedisStockRestored())) {
+            return;
+        }
+        Long restored = stringRedisTemplate.execute(
+                RESTORE_CANCELLED_STOCK_SCRIPT,
+                Collections.emptyList(),
+                order.getVoucherId().toString(), orderId.toString()
+        );
+        if (restored == null) {
+            throw new IllegalStateException("Redis 库存回补脚本无结果, orderId=" + orderId);
+        }
+        // afterCommit 回调仍持有原事务资源；用新事务持久化完成标记。
+        TransactionTemplate requiresNew = new TransactionTemplate(transactionManager);
+        requiresNew.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        Boolean marked = requiresNew.execute(status -> update()
+                .set("redis_stock_restored", true)
+                .eq("id", orderId)
+                .eq("status", ORDER_STATUS_CANCELLED)
+                .eq("redis_stock_restored", false)
+                .update());
+        if (marked) {
+            log.info("订单 {} Redis 库存回补完成，券 {}", orderId, order.getVoucherId());
+        }
     }
 
     @Override
@@ -416,6 +457,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         stringRedisTemplate.opsForValue().set(
                 SECKILL_QUEUE_KEY + orderId,
                 status,
+                SECKILL_QUEUE_TTL_MINUTES,
+                TimeUnit.MINUTES
+        );
+        // 失败结果没有订单表记录，所属用户标记必须与结果状态一起保留。
+        stringRedisTemplate.expire(
+                SECKILL_QUEUE_USER_KEY + orderId,
                 SECKILL_QUEUE_TTL_MINUTES,
                 TimeUnit.MINUTES
         );

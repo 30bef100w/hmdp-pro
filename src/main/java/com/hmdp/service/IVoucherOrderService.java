@@ -21,6 +21,9 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
     /** 取消超时未支付订单（RocketMQ 延迟消息触发，回补库存） */
     void cancelTimeoutOrder(Long orderId);
 
+    /** 重试关单后尚未完成的 Redis 库存回补 */
+    void restoreCancelledOrderRedisStock(Long orderId);
+
     /** MQ 异步落库创建订单（幂等） */
     void createOrderFromMQ(VoucherOrder voucherOrder);
 
