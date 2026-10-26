@@ -22,6 +22,9 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronizationAdapter;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
@@ -92,6 +95,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 取消超时订单：仅当订单仍处于未支付状态时回补库存
      * 由 RocketMQ 延迟消息触发；通过状态乐观更新保证幂等
      */
+    @Transactional(rollbackFor = Exception.class)
     public void cancelTimeoutOrder(Long orderId) {
         VoucherOrder order = getById(orderId);
         if (order == null || order.getStatus() == null || order.getStatus() != ORDER_STATUS_UNPAID) {
@@ -109,23 +113,47 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             return;
         }
 
-        // 回补 Redis 库存
-        stringRedisTemplate.opsForValue().increment(SECKILL_STOCK_KEY + order.getVoucherId());
-        // 回补 DB 库存
-        seckillVoucherService.update()
+        // 先在同一个数据库事务中回补 DB 库存。数据库失败时订单状态也会回滚，MQ 可以安全重试。
+        boolean stockUpdated = seckillVoucherService.update()
                 .setSql("stock = stock + 1")
                 .eq("voucher_id", order.getVoucherId())
                 .update();
+        if (!stockUpdated) {
+            throw new IllegalStateException("秒杀券不存在，无法回补库存: " + order.getVoucherId());
+        }
+
+        // Redis 是派生库存，只在 DB 事务提交后更新。进程在提交后崩溃时由对账任务修复 Redis。
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronizationAdapter() {
+            @Override
+            public void afterCommit() {
+                try {
+                    stringRedisTemplate.opsForValue().increment(SECKILL_STOCK_KEY + order.getVoucherId());
+                } catch (Exception e) {
+                    log.error("订单 {} 已取消，但 Redis 库存回补失败，等待对账修复，券 {}",
+                            orderId, order.getVoucherId(), e);
+                }
+            }
+        });
         log.info("订单 {} 超时未支付，已取消并回补库存，券 {}", orderId, order.getVoucherId());
     }
 
     @Override
     public Result payOrder(Long orderId) {
-        // 模拟支付：仅当订单未支付时改为已支付
+        Long currentUserId = currentUserId();
+        if (currentUserId == null) {
+            return Result.fail("请先登录");
+        }
+        VoucherOrder order = getById(orderId);
+        if (order == null || !currentUserId.equals(order.getUserId())) {
+            return Result.fail("订单不存在");
+        }
+
+        // 模拟支付：仅当前用户且订单仍未支付时改为已支付
         boolean updated = update()
                 .set("status", ORDER_STATUS_PAID)
                 .set("pay_time", LocalDateTime.now())
                 .eq("id", orderId)
+                .eq("user_id", currentUserId)
                 .eq("status", ORDER_STATUS_UNPAID)
                 .update();
         if (!updated) {
@@ -140,6 +168,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      * 方案 A：入口已扣 Redis，此处落库 + DB 二次扣库存
      * 方案 B：此处先 claim Redis，再落库，并回写排队终态
      */
+    @Transactional(rollbackFor = Exception.class)
     public void createOrderFromMQ(VoucherOrder voucherOrder) {
         Long userId = voucherOrder.getUserId();
         Long voucherId = voucherOrder.getVoucherId();
@@ -211,10 +240,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             try {
                 save(voucherOrder);
             } catch (DuplicateKeyException e) {
-                seckillVoucherService.update()
+                boolean restored = seckillVoucherService.update()
                         .setSql("stock = stock + 1")
                         .eq("voucher_id", voucherId)
                         .update();
+                if (!restored) {
+                    throw new IllegalStateException("重复订单回补库存失败, voucherId=" + voucherId, e);
+                }
                 if (modeB) {
                     writeQueueStatus(orderId, SeckillMode.QUEUE_SUCCESS);
                 }
@@ -320,6 +352,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         order.setSeckillMode(SeckillMode.B);
 
         writeQueueStatus(orderId, SeckillMode.QUEUE_WAITING);
+        writeQueueOwner(orderId, userId);
         try {
             SendResult sendResult = rocketMQProducer.sendOrderCreate(order);
             if (sendResult.getSendStatus() != SendStatus.SEND_OK) {
@@ -344,13 +377,32 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         data.put("orderId", orderId);
         data.put("mode", seckillMode);
 
+        Long currentUserId = currentUserId();
+        if (currentUserId == null) {
+            return Result.fail("请先登录");
+        }
         String status = stringRedisTemplate.opsForValue().get(SECKILL_QUEUE_KEY + orderId);
+        String owner = stringRedisTemplate.opsForValue().get(SECKILL_QUEUE_USER_KEY + orderId);
+        if (owner != null && !owner.equals(currentUserId.toString())) {
+            return Result.fail("订单不存在");
+        }
+
+        // 排队状态和所属用户键同时过期时，以下面的订单表归属作为最终校验。
+        VoucherOrder order = getById(orderId);
+        if (order != null && !currentUserId.equals(order.getUserId())) {
+            return Result.fail("订单不存在");
+        }
         if (status != null) {
+            if (owner == null && order == null) {
+                return Result.fail("订单不存在");
+            }
             data.put("status", status);
+            if (order != null) {
+                data.put("orderStatus", order.getStatus());
+            }
             return Result.ok(data);
         }
         // 无排队状态：方案 A 或状态已过期 → 查订单表兜底
-        VoucherOrder order = getById(orderId);
         if (order != null) {
             data.put("status", SeckillMode.QUEUE_SUCCESS);
             data.put("orderStatus", order.getStatus());
@@ -367,6 +419,19 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 SECKILL_QUEUE_TTL_MINUTES,
                 TimeUnit.MINUTES
         );
+    }
+
+    private void writeQueueOwner(Long orderId, Long userId) {
+        stringRedisTemplate.opsForValue().set(
+                SECKILL_QUEUE_USER_KEY + orderId,
+                userId.toString(),
+                SECKILL_QUEUE_TTL_MINUTES,
+                TimeUnit.MINUTES
+        );
+    }
+
+    private Long currentUserId() {
+        return UserHolder.getUser() == null ? null : UserHolder.getUser().getId();
     }
 
     /*@Override
