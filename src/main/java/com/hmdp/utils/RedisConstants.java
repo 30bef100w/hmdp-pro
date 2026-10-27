@@ -30,6 +30,8 @@ public class RedisConstants {
     public static final String SECKILL_QUEUE_KEY = "seckill:queue:";
     /** 方案 B 排队订单所属用户 seckill:queue:user:{orderId} */
     public static final String SECKILL_QUEUE_USER_KEY = "seckill:queue:user:";
+    /** 方案 B 重复下单时已有订单号 seckill:queue:existing-order:{orderId} */
+    public static final String SECKILL_QUEUE_EXISTING_ORDER_KEY = "seckill:queue:existing-order:";
     /** 排队状态 TTL（分钟） */
     public static final long SECKILL_QUEUE_TTL_MINUTES = 5L;
     public static final String BLOG_LIKED_KEY = "blog:liked:";

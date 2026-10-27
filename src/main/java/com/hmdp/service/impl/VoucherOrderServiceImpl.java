@@ -229,20 +229,22 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         if (!early) {
             locked = redisLock.tryLock();
             if (!locked) {
-                if (modeB) {
-                    throw new RuntimeException("获取下单锁失败，等待重试, orderId=" + orderId);
-                }
-                log.error("不允许重复下单！");
-                return;
+                // Redis 入口扣库存后，必须让 MQ 重试；直接确认会造成库存已扣但订单未落库。
+                throw new RuntimeException("获取下单锁失败，等待重试, orderId=" + orderId);
             }
         }
 
         try {
             if (!early) {
-                int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
-                if (count > 0) {
+                VoucherOrder existingOrder = query()
+                        .eq("user_id", userId)
+                        .eq("voucher_id", voucherId)
+                        .last("LIMIT 1")
+                        .one();
+                if (existingOrder != null) {
                     if (modeB) {
-                        writeQueueStatus(orderId, SeckillMode.QUEUE_SUCCESS);
+                        writeQueueStatus(orderId, SeckillMode.QUEUE_FAIL_REPEAT);
+                        writeQueueExistingOrder(orderId, existingOrder.getId());
                     } else {
                         log.error("不允许重复下单！");
                     }
@@ -289,7 +291,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     throw new IllegalStateException("重复订单回补库存失败, voucherId=" + voucherId, e);
                 }
                 if (modeB) {
-                    writeQueueStatus(orderId, SeckillMode.QUEUE_SUCCESS);
+                    VoucherOrder existingOrder = query()
+                            .eq("user_id", userId)
+                            .eq("voucher_id", voucherId)
+                            .last("LIMIT 1")
+                            .one();
+                    writeQueueStatus(orderId, SeckillMode.QUEUE_FAIL_REPEAT);
+                    if (existingOrder != null) {
+                        writeQueueExistingOrder(orderId, existingOrder.getId());
+                    }
                 }
                 log.warn("重复订单消息，唯一索引拦截并回补DB库存, userId={}, voucherId={}", userId, voucherId);
                 return;
@@ -438,6 +448,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 return Result.fail("订单不存在");
             }
             data.put("status", status);
+            String existingOrderId = stringRedisTemplate.opsForValue()
+                    .get(SECKILL_QUEUE_EXISTING_ORDER_KEY + orderId);
+            if (existingOrderId != null) {
+                data.put("existingOrderId", Long.valueOf(existingOrderId));
+            }
             if (order != null) {
                 data.put("orderStatus", order.getStatus());
             }
@@ -472,6 +487,15 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         stringRedisTemplate.opsForValue().set(
                 SECKILL_QUEUE_USER_KEY + orderId,
                 userId.toString(),
+                SECKILL_QUEUE_TTL_MINUTES,
+                TimeUnit.MINUTES
+        );
+    }
+
+    private void writeQueueExistingOrder(Long orderId, Long existingOrderId) {
+        stringRedisTemplate.opsForValue().set(
+                SECKILL_QUEUE_EXISTING_ORDER_KEY + orderId,
+                existingOrderId.toString(),
                 SECKILL_QUEUE_TTL_MINUTES,
                 TimeUnit.MINUTES
         );

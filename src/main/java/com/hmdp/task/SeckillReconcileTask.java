@@ -65,6 +65,7 @@ public class SeckillReconcileTask {
             return; // 其他实例正在对账
         }
         try {
+            repairMissingRedisStocks();
             closeTimeoutOrders();
             restoreCancelledOrderRedisStocks();
             supplementMissingOrders();
@@ -73,6 +74,40 @@ public class SeckillReconcileTask {
             log.error("秒杀对账任务执行异常", e);
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * 发布事务提交后 Redis 初始化失败时补建库存键。
+     * 只有尚无 claim 用户的活动券才允许按 DB 库存初始化，避免覆盖正在进行的秒杀库存。
+     */
+    private void repairMissingRedisStocks() {
+        List<SeckillVoucher> active = seckillVoucherService.lambdaQuery()
+                .ge(SeckillVoucher::getEndTime, LocalDateTime.now())
+                .list();
+        for (SeckillVoucher voucher : active) {
+            Long voucherId = voucher.getVoucherId();
+            String stockKey = SECKILL_STOCK_KEY + voucherId;
+            if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(stockKey))) {
+                continue;
+            }
+            Long claimed = stringRedisTemplate.opsForSet()
+                    .size(RedisConstants.SECKILL_ORDER_KEY + voucherId);
+            if (claimed != null && claimed > 0) {
+                log.error("Redis 库存缺失但已有 claim 用户，跳过自动重置，voucherId={}, claimed={}",
+                        voucherId, claimed);
+                continue;
+            }
+            if (voucher.getStock() == null) {
+                log.error("Redis 库存缺失且 DB 库存为空，跳过补偿，voucherId={}", voucherId);
+                continue;
+            }
+            try {
+                stringRedisTemplate.opsForValue().setIfAbsent(stockKey, String.valueOf(voucher.getStock()));
+                log.warn("补偿初始化秒杀券 Redis 库存，voucherId={}, stock={}", voucherId, voucher.getStock());
+            } catch (Exception e) {
+                log.error("补偿初始化秒杀券 Redis 库存失败，voucherId={}", voucherId, e);
+            }
         }
     }
 
