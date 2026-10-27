@@ -25,6 +25,14 @@ mybatis-plus:
 # ===== RocketMQ 消息队列 =====
 rocketmq:
   name-server: 127.0.0.1:9876
+  consumer:
+    # 超过次数后由 RocketMQ 投递到 %DLQ%<consumer-group>，需配合 Broker 运维查看
+    max-reconsume-times: 16
+canal:
+  # Canal 是可选的缓存驱逐链路；未部署 Canal 时保持关闭，避免应用启动依赖该 Topic
+  enabled: false
+  consumer:
+    max-reconsume-times: 16
 # ===== 秒杀方案：A=入口预扣+事务消息；B=限流入队+消费者校验 =====
 seckill:
   mode: A

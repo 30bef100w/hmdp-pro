@@ -60,4 +60,16 @@ JDK 8 · MySQL · Redis · RocketMQ → 导入 `src/main/resources/db/hmdp.sql` 
 已有数据库升级时，先执行 `src/main/resources/db/migrate-redis-stock-restored.sql`，再启动新版应用；全新导入 `hmdp.sql` 不需要执行迁移。
 网关示例配置：`src/main/resources/openresty/`。
 
+### 本地依赖一键启动
+
+已提供 `docker-compose.yml`，只启动 MySQL、Redis 和 RocketMQ，不构建 Java 应用：
+
+```bash
+docker compose up -d
+```
+
+默认连接参数为 MySQL `127.0.0.1:3306/hmdp`（root/root）、Redis `127.0.0.1:6379`、RocketMQ NameServer `127.0.0.1:9876`。首次启动 MySQL 会自动执行 `src/main/resources/db/hmdp.sql`；如果数据库卷已经存在，需手动执行后续迁移脚本。
+
+RocketMQ 消费者失败超过 `rocketmq.consumer.max-reconsume-times` 后会进入对应消费者组的死信队列（`%DLQ%<consumer-group>`）。当前应用将消息按单条确认，并在日志中记录消息 ID 和重试次数，便于定位死信。Canal 缓存驱逐消费者默认关闭；部署 Canal 后设置 `canal.enabled=true` 再启动。
+
 如果这个项目对你复习高并发或准备面试有帮助，欢迎点一颗 Star 支持一下。

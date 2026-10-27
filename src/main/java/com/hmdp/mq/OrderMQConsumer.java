@@ -28,6 +28,9 @@ public class OrderMQConsumer {
     @Value("${rocketmq.name-server}")
     private String nameServer;
 
+    @Value("${rocketmq.consumer.max-reconsume-times:16}")
+    private int maxReconsumeTimes;
+
     private final IVoucherOrderService voucherOrderService;
 
     public OrderMQConsumer(IVoucherOrderService voucherOrderService) {
@@ -40,6 +43,9 @@ public class OrderMQConsumer {
     public void init() throws Exception {
         consumer = new DefaultMQPushConsumer(RocketMQConstants.ORDER_CONSUMER_GROUP);
         consumer.setNamesrvAddr(nameServer);
+        consumer.setMaxReconsumeTimes(maxReconsumeTimes);
+        // 订单消息逐条确认，避免同一批中前面的成功消息因后续失败而重复消费。
+        consumer.setConsumeMessageBatchMaxSize(1);
         // 消费者组首次启动时从最早位置消费；之后从上次消费位点续读
         consumer.setConsumeFromWhere(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET);
         consumer.subscribe(RocketMQConstants.ORDER_TOPIC, "CREATE || TIMEOUT");
@@ -57,7 +63,8 @@ public class OrderMQConsumer {
                         log.warn("未知消息 Tag: {}", tag);
                     }
                 } catch (Exception e) {
-                    log.error("订单消息处理失败, tag={}, body={}", tag, body, e);
+                    log.error("订单消息处理失败, tag={}, msgId={}, reconsumeTimes={}, body={}",
+                            tag, msg.getMsgId(), msg.getReconsumeTimes(), body, e);
                     // 消费失败稍后重试；业务处理本身幂等，重复消费安全
                     return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                 }

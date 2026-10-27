@@ -10,6 +10,7 @@ import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
 import org.apache.rocketmq.client.consumer.listener.MessageListenerConcurrently;
 import org.apache.rocketmq.common.consumer.ConsumeFromWhere;
 import org.apache.rocketmq.common.message.MessageExt;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -29,12 +30,16 @@ import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
  */
 @Slf4j
 @Component
+@ConditionalOnProperty(prefix = "canal", name = "enabled", havingValue = "true")
 public class CanalMQConsumer {
 
     public static final String CANAL_TOPIC = "canal-binlog-topic";
 
     @Value("${rocketmq.name-server}")
     private String nameServer;
+
+    @Value("${canal.consumer.max-reconsume-times:16}")
+    private int maxReconsumeTimes;
 
     @Resource
     private MultiLevelCacheService multiLevelCacheService;
@@ -49,6 +54,9 @@ public class CanalMQConsumer {
 
         consumer = new DefaultMQPushConsumer("canal-cache-consumer-group");
         consumer.setNamesrvAddr(nameServer);
+        consumer.setMaxReconsumeTimes(maxReconsumeTimes);
+        // 单条消费，避免一个坏事件导致同批已成功事件重复投递。
+        consumer.setConsumeMessageBatchMaxSize(1);
         consumer.setConsumeFromWhere(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET);
         consumer.subscribe(CANAL_TOPIC, "*");
         consumer.registerMessageListener((MessageListenerConcurrently) (msgs, context) -> {
@@ -56,7 +64,8 @@ public class CanalMQConsumer {
                 try {
                     handleBinlogEvent(new String(msg.getBody(), StandardCharsets.UTF_8));
                 } catch (Exception e) {
-                    log.error("binlog 事件处理失败, msgId={}", msg.getMsgId(), e);
+                    log.error("binlog 事件处理失败, msgId={}, reconsumeTimes={}",
+                            msg.getMsgId(), msg.getReconsumeTimes(), e);
                     return ConsumeConcurrentlyStatus.RECONSUME_LATER;
                 }
             }
